@@ -8,38 +8,24 @@ import seaborn as sns
 sns.set_style('darkgrid')
 
 
-def L1(x):
-    return np.linalg.norm(x, ord=1, axis=-1)
-
-def L2(x):
-    return np.linalg.norm(x, ord=2, axis=-1)
-
-def Linf(x):
-    return x.max(axis=-1)
-
-OBJECTIVES = {
-    'center_l2': lambda X, A, v: (v * L2(X[...,None,:] - A)).max(axis=-1),
-    'median_l2': lambda X, A, v: (v * L2(X[...,None,:] - A)).sum(axis=-1)
-}
-
 #%%
 class Problem:
 
-    def __init__(self, A, v, objective='median_l2'):
+    def __init__(self, A, v, objective, title=None):
         assert len(A.shape) == 2, '`A` argument must be a matrix'
         assert len(v.shape) == 1, '`v` argument must be a vector'
         assert A.shape[0] == v.shape[0], '`A` and `v` first axis must match'
         assert A.shape[1] == 2, '`A` must be an mx2 matrix'
-        assert objective in OBJECTIVES, 'Invalid objective'
         self.objective = objective
         self.A = A
         self.v = v
-        self.f = OBJECTIVES[objective]
+        self.f = objective
         self.m = A.shape[0]
         self.conv = scipy.spatial.ConvexHull(self.A)
+        self.title = title or f'{self.m} locations'
 
     def __call__(self, x):
-        return self.f(np.asarray(x), self.A, self.v)
+        return self.f(self.A, self.v, np.asarray(x))
 
     def get_centroid(self, weighted=True):
         if weighted:
@@ -47,6 +33,41 @@ class Problem:
         else:
             w = np.ones(self.m)
         return np.average(self.A, weights=w, axis=0)
+
+    @classmethod
+    def premade(cls, name, **kwargs):
+        options = {
+            'equilateral': (
+                [(-1, -(3**0.5)/2), (+1, -(3**0.5)/2), (0, +3**0.5/2)],
+                [1] * 3,
+            ),
+            'five': (
+                [(-1, -1), (+1, -1), (-1, +1), (+1, +1), (0, 0)],
+                [1] * 5,
+            ),
+            'box': (
+                [(-1, -1), (+1, -1), (-1, +1), (+1, +1)],
+                [1] * 4,
+            ),
+            'rectangle': (
+                [(-0.1, -1), (+0.1, -1), (-0.1, +1), (+0.1, +1)],
+                [1] * 4,
+            ),
+            'uneven_rectangle': (
+                [(-0.1, -1), (+0.1, -1), (-0.1, +1), (+0.1, +1)],
+                [2, 2, 1, 1],
+            ),
+            'outlier': (
+                [(-0.5, -0.5), (-0.5, +0.5), (+0.5, -0.5), (+0.5, +0.5), (3, 0)],
+                [1, 1, 1, 1, 4],
+            ),
+        }
+        if not name in options:
+            raise ValueError(
+                f'Bad problem name "{name}". Choose among: {list(options)}'
+            )
+        A, v = map(np.array, options[name])
+        return cls(A, v, **kwargs)
 
     @classmethod
     def generate(cls,
@@ -89,24 +110,37 @@ class Problem:
         res=100,
         cmap='Blues_r',
         verbose=False,
+        legend=None,
+        figsize=None,
     ):
+        if ax is None:
+            if not figsize is None:
+                plt.figure(figsize=figsize)
+            ax = plt.gca()
+
+        legend = self.m <= 20 if legend is None else legend
 
         # Determine viewpoirt
-        x0_min = min(self.A[:,0].min(), -1.2) if x0_min is None else x0_min
-        x0_max = max(self.A[:,0].max(), +1.2) if x0_max is None else x0_max
-        x1_min = min(self.A[:,1].min(), -1.2) if x1_min is None else x1_min
-        x1_max = max(self.A[:,1].max(), +1.2) if x1_max is None else x1_max
+        x0_min = min(self.A[:,0].min(), -1) * 1.2 if x0_min is None else x0_min
+        x0_max = max(self.A[:,0].max(), +1) * 1.2 if x0_max is None else x0_max
+        x1_min = min(self.A[:,1].min(), -1) * 1.2 if x1_min is None else x1_min
+        x1_max = max(self.A[:,1].max(), +1) * 1.2 if x1_max is None else x1_max
+        x0_delta = x0_max - x0_min
+        x1_delta = x1_max - x1_min
+
+        res0 = int(res * max(1, x0_delta / x1_delta))
+        res1 = int(res * max(1, x1_delta / x0_delta))
 
         # Create viewport transform (since heatmap use raster pixel coordinates)
         def map_x0(x0):
-            return res * (x0 - x0_min) / (x0_max - x0_min)
+            return res0 * (x0 - x0_min) / x0_delta
 
         def map_x1(x1):
-            return res * (x1 - x1_min) / (x1_max - x1_min)
+            return res1 * (x1 - x1_min) / x1_delta
 
         # Rasterize
-        x0 = np.linspace(x0_min, x0_max, res)
-        x1 = np.linspace(x1_min, x1_max, res)
+        x0 = np.linspace(x0_min, x0_max, res0)
+        x1 = np.linspace(x1_min, x1_max, res1)
         X0, X1 = np.meshgrid(x0, x1)
         X = np.stack([X0, X1], axis=-1)
         L = self(X)
@@ -141,11 +175,17 @@ class Problem:
 
         # Plot As
         colors = sns.color_palette(n_colors=self.m)
+        if self.m > 20:
+            colors = [colors[0]] * self.m
+
         for i, ((a0, a1), v, c) in enumerate(zip(self.A, self.v, colors)):
-            if verbose:
-                label = f'$a^{{{i}}}$ ($x_0={a0:.2f}$, $x_1={a1:.2f}$, $v={v:.2f}$)'
+            if legend:
+                if verbose:
+                    label = f'$a^{{{i}}}$ ($x_0={a0:.2f}$, $x_1={a1:.2f}$, $v={v:.2f}$)'
+                else:
+                    label = f'$a^{{{i}}}$ ($v^{{{i}}}={v:.2f}$)'
             else:
-                label = f'$a^{{{i}}}$ (${v:.2f}$)'
+                label = None
             ax.scatter(
                 map_x0(a0), map_x1(a1),
                 s=25 + 75 * v,
@@ -163,6 +203,8 @@ class Problem:
 
         # Plot iterates if provided
         if not iterates is None and len(iterates):
+            if isinstance(iterates, pd.DataFrame):
+                iterates = iterates[['x0', 'x1']]
             iterates = np.asarray(iterates)
             it0 = map_x0(iterates[:,0])
             it1 = map_x0(iterates[:, 1])
@@ -173,14 +215,17 @@ class Problem:
                 s=200,
                 marker='*',
                 color='red',
-                label='$x_n$',
+                label='$x^t$',
                 zorder=4,
                 edgecolors='0'
             )
 
         # Add legend and labels
         # ax.legend(loc='upper center', bbox_to_anchor=(0.5,1.15), ncol=4, fancybox=True)
-        ax.legend(loc='upper left', bbox_to_anchor=(1.0, 1.0))
+        if legend:
+            ax.legend(loc='upper left', bbox_to_anchor=(1.0, 1.0))
+        else:
+            ax.legend().remove()
         ax.set_xlabel('$x_0$')
         ax.set_ylabel('$x_1$')
 
@@ -196,13 +241,16 @@ class Problem:
         x1_max=None,
         res=100,
         cmap='Blues_r',
+        legend=None,
+        figsize=None,
     ):
+        legend = self.m <= 20 if legend is None else legend
 
         # Determine viewpoirt
-        x0_min = min(self.A[:,0].min(), -1.2) if x0_min is None else x0_min
-        x0_max = max(self.A[:,0].max(), +1.2) if x0_max is None else x0_max
-        x1_min = min(self.A[:,1].min(), -1.2) if x1_min is None else x1_min
-        x1_max = max(self.A[:,1].max(), +1.2) if x1_max is None else x1_max
+        x0_min = min(self.A[:,0].min(), -1) * 1.2 if x0_min is None else x0_min
+        x0_max = max(self.A[:,0].max(), +1) * 1.2 if x0_max is None else x0_max
+        x1_min = min(self.A[:,1].min(), -1) * 1.2 if x1_min is None else x1_min
+        x1_max = max(self.A[:,1].max(), +1) * 1.2 if x1_max is None else x1_max
 
         # Rasterize
         x0 = np.linspace(x0_min, x0_max, res)
@@ -212,7 +260,10 @@ class Problem:
         L = self(X)
 
         # Make surface plot as backdrop
-        ax = ax or plt.gca(projection='3d')
+        if ax is None:
+            if not figsize is None:
+                plt.figure(figsize=figsize)
+            ax = plt.gca(projection='3d')
         ax.plot_surface(
             X0, X1, L,
             rstride=1,
@@ -243,6 +294,8 @@ class Problem:
 
         # Plot iterates if provided
         if not iterates is None and len(iterates):
+            if isinstance(iterates, pd.DataFrame):
+                iterates = iterates[['x0', 'x1']]
             iterates = np.asarray(iterates)
             it0 = iterates[:,0]
             it1 = iterates[:, 1]
@@ -252,7 +305,8 @@ class Problem:
             # ax.scatter(it0[-1:], it1[-1:], marker='*', color='red', label='$x_n$')
 
         # Add legend and labels
-        ax.legend(loc='upper center', bbox_to_anchor=(0.5,1.15), ncol=4, fancybox=True)
+        if legend:
+            ax.legend(loc='upper center', bbox_to_anchor=(0.5,1.15), ncol=4, fancybox=True)
         ax.set_xlabel('$x_0$')
         ax.set_ylabel('$x_1$')
         ax.set_zlabel('$f(x_0, x_1)$')
